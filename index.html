@@ -1400,7 +1400,7 @@
         idMap[exam.id] = remoteId; desiredIds.push(remoteId);
         const { error: examError } = await supabaseClient.from('exams').upsert({
           id: remoteId, teacher_id: teacherUser.id, title: exam.title || 'Untitled exam',
-          description: exam.description || '', duration_minutes: Math.max(1, Math.min(600, Number(exam.durationMinutes) || 20)), status: 'draft'
+          description: exam.description || '', duration_minutes: Math.max(1, Math.min(600, Number(exam.durationMinutes) || 20)), status: exam.status || 'draft'
         }, { onConflict: 'id' });
         if (examError) throw examError;
         const { error: deleteError } = await supabaseClient.from('exam_questions').delete().eq('exam_id', remoteId);
@@ -1438,6 +1438,9 @@
       if (!data || !data.length) {
         // First login: migrate this browser's existing library to the teacher's cloud account.
         await saveExamsToCloud();
+        const migratedMap = getCloudIdMap();
+        exams = exams.map(exam => ({ ...exam, id: migratedMap[exam.id] || exam.id, status: exam.status || 'draft' }));
+        try { localStorage.setItem(STORAGE_KEY_EXAMS, JSON.stringify(exams)); } catch (e) {}
         return;
       }
       cloudHydrating = true;
@@ -1450,12 +1453,66 @@
           type: q.question_type, mark: Number(q.marks) || 1
         }));
         return { id: row.id, title: row.title, description: row.description || '', teacher: 'Mr. Osama',
-          durationMinutes: row.duration_minutes || 20, questions };
+          durationMinutes: row.duration_minutes || 20, status: row.status || 'draft', questions };
       });
       setCloudIdMap(map);
       try { localStorage.setItem(STORAGE_KEY_EXAMS, JSON.stringify(exams)); } catch (e) {}
       cloudHydrating = false;
     }
+    async function loadSubmissionsFromCloud() {
+      if (!supabaseClient || !teacherUser) return;
+      const { data, error } = await supabaseClient.from('exam_submissions')
+        .select('id,exam_id,student_name,score,total_marks,percentage,submitted_at,exams(title),submission_answers(id,question_id,answer_data,is_correct,marks_awarded,exam_questions(question_type,question_data,answer_key,marks))')
+        .order('submitted_at', { ascending: false });
+      if (error) throw error;
+      submissions = (data || []).map(row => {
+        const breakdown = (row.submission_answers || []).map(answerRow => {
+          const q = answerRow.exam_questions || {};
+          const key = q.answer_key || {};
+          const publicQ = q.question_data || {};
+          const studentAnswer = answerRow.answer_data;
+          const item = {
+            questionId: answerRow.question_id,
+            questionType: q.question_type || key.type || '',
+            title: key.title || publicQ.title || '',
+            prompt: key.prompt || publicQ.prompt || '',
+            earnedMark: Number(answerRow.marks_awarded) || 0,
+            possibleMark: Number(q.marks) || 1,
+            studentAnswer,
+            correctAnswer: key.correctAnswer,
+            explanation: key.explanation || '',
+            isCorrect: answerRow.is_correct === true,
+            details: null
+          };
+          if (item.questionType === 'fillpassage') {
+            item.details = (key.gaps || []).map(gap => ({
+              gapId: gap.id, gapLabel: gap.label,
+              chosenWord: (studentAnswer || {})[gap.id] || '(Empty)',
+              correctWord: gap.correctAnswer,
+              isCorrect: String(((studentAnswer || {})[gap.id] || '')).trim().toLowerCase() === String(gap.correctAnswer || '').trim().toLowerCase(),
+              explanation: gap.explanation || ''
+            }));
+          }
+          if (item.questionType === 'paragraph') {
+            item.modelAnswer = key.modelAnswer || '';
+            item.rubric = key.rubric || '';
+            const words = String(studentAnswer || '').trim().split(/\s+/).filter(Boolean);
+            item.wordCount = words.length;
+          }
+          return item;
+        });
+        return {
+          id: row.id, examId: row.exam_id,
+          examTitle: row.exams?.title || 'Exam', studentName: row.student_name,
+          score: Number(row.score) || 0, totalMarks: Number(row.total_marks) || 0,
+          percentage: Number(row.percentage) || 0,
+          timestamp: row.submitted_at ? new Date(row.submitted_at).toLocaleString() : '',
+          breakdown
+        };
+      });
+      if (currentRole === 'teacher') renderTeacherDashboard();
+    }
+
     async function initializeCloudAuth() {
       if (!window.supabase?.createClient) { setTeacherAuthMessage('Could not load the Supabase library. Check your internet connection.'); return; }
       supabaseClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY);
@@ -1463,7 +1520,7 @@
       if (error) console.warn('Could not read Supabase session:', error.message);
       teacherUser = data?.session?.user || null;
       if (teacherUser) {
-        try { await loadExamsFromCloud(); hideTeacherAuthGate(); }
+        try { await loadExamsFromCloud(); await loadSubmissionsFromCloud(); hideTeacherAuthGate(); }
         catch (err) { console.error(err); showTeacherAuthGate(); setTeacherAuthMessage('Cloud connection error: ' + (err.message || 'Please try again.')); }
       }
       supabaseClient.auth.onAuthStateChange((_event, session) => {
@@ -1477,6 +1534,7 @@
       if (error) throw error;
       teacherUser = data.user;
       await loadExamsFromCloud();
+      await loadSubmissionsFromCloud();
       hideTeacherAuthGate();
       switchRole('teacher');
     }
@@ -1928,6 +1986,7 @@
     // --- 6. STATE VARIABLES & CONTROLS ---
     let currentRole = 'teacher';
     let activeStudentExam = null;
+    let publicExamToken = null; // Present only when a student opens a secure published link.
     let activeStudentName = '';
     let studentAnswers = {};
     let activeGapTarget = null;
@@ -2134,6 +2193,7 @@
 
     // --- 8. STUDENT WORKFLOW & EXAM SESSION ---
     function launchStudentExam(examId) {
+      publicExamToken = null;
       const match = exams.find(e => e.id === examId);
       if (!match) return;
       activeStudentExam = match;
@@ -2616,9 +2676,31 @@
     // --- 9. INSTANT AUTO-GRADING & SUBMISSION ---
     let latestSubmission = null;
 
-    function submitActiveExam() {
+    async function submitActiveExam() {
       stopExamCountdown();
       stopSpeaking();
+
+      // Publicly shared exams are graded and stored by a trusted Edge Function.
+      // The browser never receives the answer key before submission.
+      if (publicExamToken) {
+        const submitButtons = [document.getElementById('btnSubmitExamTop'), document.getElementById('btnSubmitExamBottom')];
+        submitButtons.forEach(button => { if (button) { button.disabled = true; button.dataset.oldText = button.textContent; button.textContent = currentLang === 'ar' ? 'جارٍ الإرسال...' : 'Submitting...'; } });
+        try {
+          const { data, error } = await supabaseClient.functions.invoke('student-exams', {
+            body: { action: 'submit', token: publicExamToken, studentName: activeStudentName, answers: studentAnswers }
+          });
+          if (error) throw error;
+          if (!data?.submission) throw new Error(data?.error || 'The server did not return a result.');
+          latestSubmission = data.submission;
+          displayInstantResults(data.submission);
+        } catch (err) {
+          console.error('Secure exam submission failed:', err);
+          showToast((currentLang === 'ar' ? 'تعذر إرسال الامتحان: ' : 'Could not submit exam: ') + (err.message || 'Please try again.'), 'error');
+        } finally {
+          submitButtons.forEach(button => { if (button) { button.disabled = false; button.textContent = button.dataset.oldText || (currentLang === 'ar' ? 'إرسال الإجابات' : 'Submit Answers'); } });
+        }
+        return;
+      }
 
       let totalEarned = 0;
       let totalPossible = calculateExamTotalMarks(activeStudentExam);
@@ -3240,22 +3322,36 @@ Answers:
     }
 
     // --- 11. SHARE & SUBMISSION DETAILS MODALS ---
-    function openShareModal(examId) {
+    async function openShareModal(examId) {
       const exam = exams.find(e => e.id === examId);
       if (!exam) return;
-
       document.getElementById('shareModalExamTitle').textContent = `Exam: "${exam.title}"`;
-      const base = window.location.href.split('#')[0].split('?')[0];
-      const link = `${base}?exam=${exam.id}#exam=${exam.id}`;
-      document.getElementById('shareExamLinkInput').value = link;
-
+      const input = document.getElementById('shareExamLinkInput');
+      input.value = currentLang === 'ar' ? 'جارٍ إنشاء رابط آمن...' : 'Creating secure student link...';
+      document.getElementById('modalShareExam').classList.remove('hidden');
+      document.getElementById('modalShareExam').classList.add('flex');
       document.getElementById('btnTestAsStudentFromModal').onclick = () => {
         closeShareModal();
         launchStudentExam(exam.id);
       };
-
-      document.getElementById('modalShareExam').classList.remove('hidden');
-      document.getElementById('modalShareExam').classList.add('flex');
+      try {
+        if (!supabaseClient || !teacherUser) throw new Error('Please sign in as the teacher first.');
+        // On first-login migration, local IDs map to their UUIDs in Supabase.
+        const remoteExamId = getCloudIdMap()[exam.id] || exam.id;
+        const { data, error } = await supabaseClient.functions.invoke('student-exams', {
+          body: { action: 'publish', examId: remoteExamId }
+        });
+        if (error) throw error;
+        if (!data?.token) throw new Error(data?.error || 'The server did not create a link.');
+        const base = window.location.href.split('#')[0].split('?')[0];
+        input.value = `${base}?token=${encodeURIComponent(data.token)}`;
+        exam.status = 'published';
+        try { localStorage.setItem(STORAGE_KEY_EXAMS, JSON.stringify(exams)); } catch (e) {}
+        showToast(currentLang === 'ar' ? 'تم إنشاء رابط آمن للطلاب.' : 'Secure student link created.', 'success');
+      } catch (err) {
+        input.value = '';
+        showToast((currentLang === 'ar' ? 'تعذر إنشاء الرابط: ' : 'Could not create link: ') + (err.message || 'Check Edge Function setup.'), 'error');
+      }
     }
 
     function closeShareModal() {
@@ -3757,17 +3853,33 @@ Answers:
       // Initialize cloud auth before choosing the initial view.
       await initializeCloudAuth();
 
-      // Check URL parameters for direct student exam link sharing
+      // Secure public student links use a random token; exam IDs alone are not public access.
       const urlParams = new URLSearchParams(window.location.search);
-      const examParam = urlParams.get('exam') || (window.location.hash.includes('exam=') ? window.location.hash.split('exam=')[1] : null);
+      const publicToken = urlParams.get('token');
+      const legacyExamParam = urlParams.get('exam') || (window.location.hash.includes('exam=') ? window.location.hash.split('exam=')[1] : null);
 
-      if (examParam) {
-        const found = exams.find(e => e.id === examParam);
+      if (publicToken) {
+        try {
+          const { data, error } = await supabaseClient.functions.invoke('student-exams', {
+            body: { action: 'resolve', token: publicToken }
+          });
+          if (error) throw error;
+          if (!data?.exam || !Array.isArray(data.exam.questions)) throw new Error(data?.error || 'This exam link is invalid or expired.');
+          publicExamToken = publicToken;
+          activeStudentExam = data.exam;
+          switchRole('student');
+        } catch (err) {
+          console.error('Could not load public exam:', err);
+          showToast((currentLang === 'ar' ? 'تعذر فتح الامتحان: ' : 'Could not open exam: ') + (err.message || 'Invalid link.'), 'error');
+          switchRole(teacherUser ? 'teacher' : 'student');
+        }
+      } else if (legacyExamParam) {
+        const found = exams.find(e => e.id === legacyExamParam);
         if (found) {
           activeStudentExam = found;
           switchRole('student', found.id);
         } else {
-          switchRole('teacher');
+          switchRole(teacherUser ? 'teacher' : 'student');
         }
       } else {
         switchRole('teacher');
